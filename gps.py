@@ -2,32 +2,43 @@ import serial
 import pynmea2
 import time
 
-PORT = "/dev/serial0"   # thường là serial0 trên Raspberry Pi
-BAUD = 9600             # GNSS L76K thường 9600
+PORT = "/dev/ttyAMA0"
+BAUD = 9600
 
 ser = serial.Serial(PORT, BAUD, timeout=1)
 
-last_print = 0
+last = 0
+last_seen = {"sats": None, "fix": None, "lat": None, "lon": None, "status": None}
+
 while True:
     line = ser.readline().decode("ascii", errors="replace").strip()
     if not line.startswith("$"):
         continue
 
-    # Lọc câu hay dùng để lấy vị trí
-    if line.startswith("$GNRMC") or line.startswith("$GPRMC") or line.startswith("$GNGGA") or line.startswith("$GPGGA"):
-        try:
-            msg = pynmea2.parse(line)
-        except pynmea2.ParseError:
-            continue
+    try:
+        msg = pynmea2.parse(line)
+    except pynmea2.ParseError:
+        continue
 
-        lat = getattr(msg, "latitude", None)
-        lon = getattr(msg, "longitude", None)
+    # GGA: có fix quality + satellites
+    if msg.sentence_type == "GGA":
+        # pynmea2: gps_qual (0/1/2...), num_sats
+        last_seen["fix"] = getattr(msg, "gps_qual", None)
+        last_seen["sats"] = getattr(msg, "num_sats", None)
+        last_seen["lat"] = getattr(msg, "latitude", None) or last_seen["lat"]
+        last_seen["lon"] = getattr(msg, "longitude", None) or last_seen["lon"]
 
-        # Một số câu có status (RMC): A=valid, V=void
-        status = getattr(msg, "status", None)
+    # RMC: có status A/V
+    if msg.sentence_type == "RMC":
+        last_seen["status"] = getattr(msg, "status", None)
+        last_seen["lat"] = getattr(msg, "latitude", None) or last_seen["lat"]
+        last_seen["lon"] = getattr(msg, "longitude", None) or last_seen["lon"]
 
+    now = time.time()
+    if now - last > 1:
+        lat, lon = last_seen["lat"], last_seen["lon"]
         if lat and lon:
-            now = time.time()
-            if now - last_print > 1:
-                print(f"lat={lat:.6f}, lon={lon:.6f}, status={status}, sentence={msg.sentence_type}")
-                last_print = now
+            print(f"FIX OK lat={lat:.6f} lon={lon:.6f} sats={last_seen['sats']} fix={last_seen['fix']} rmc={last_seen['status']}")
+        else:
+            print(f"Waiting for fix... sats={last_seen['sats']} fix={last_seen['fix']} rmc={last_seen['status']}")
+        last = now
