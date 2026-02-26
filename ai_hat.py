@@ -15,13 +15,17 @@ Usage:
 
 import argparse
 import json
+import os
 import threading
 import time
 
 import cv2
-from flask import Flask, Response, render_template_string, stream_with_context
+from flask import Flask, Response, jsonify, render_template, stream_with_context
 from picamera2 import Picamera2
 from picamera2.devices import Hailo, hailo_architecture
+
+# Directory that contains this script – used for local HEF / label look-ups.
+_HERE = os.path.dirname(os.path.abspath(__file__))
 
 # ---------------------------------------------------------------------------
 # Flask application
@@ -32,6 +36,7 @@ app = Flask(__name__)
 _lock = threading.Lock()
 _latest_jpeg: bytes = b""
 _current_detections: list = []
+_model_path: str = ""
 
 # Events that wake streaming threads when new data is available.
 _frame_event = threading.Event()
@@ -68,7 +73,8 @@ def extract_detections(hailo_output, video_w: int, video_h: int,
 
 def inference_loop(model_path: str, labels_path: str,
                    score_thresh: float, camera_num: int) -> None:
-    global _latest_jpeg, _current_detections
+    global _latest_jpeg, _current_detections, _model_path
+    _model_path = model_path
 
     with open(labels_path, "r", encoding="utf-8") as f:
         class_names = f.read().splitlines()
@@ -160,137 +166,17 @@ def _sse_generator():
             last_dets = current
 
 # ---------------------------------------------------------------------------
-# HTML template (embedded – no separate templates/ folder needed)
-# ---------------------------------------------------------------------------
-
-_INDEX_HTML = """<!DOCTYPE html>
-<html lang="en">
-<head>
-  <meta charset="UTF-8"/>
-  <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>AI HAT – Object Detection</title>
-  <style>
-    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
-    body {
-      display: flex; flex-direction: column; height: 100vh;
-      font-family: 'Segoe UI', sans-serif; background: #0f0f0f; color: #eee;
-    }
-    header {
-      display: flex; align-items: center; gap: 10px;
-      padding: 10px 18px; background: #1a1a2e;
-      font-size: 1.1rem; font-weight: bold; border-bottom: 2px solid #4fc3f7;
-    }
-    header span { color: #4fc3f7; }
-    main { display: flex; flex: 1; overflow: hidden; gap: 8px; padding: 8px; }
-
-    /* ── Video panel ────────────────────────────────── */
-    #video-panel {
-      flex: 3; display: flex; flex-direction: column;
-      background: #000; border-radius: 10px; overflow: hidden;
-    }
-    #video-panel .panel-title {
-      padding: 6px 12px; background: #111; font-size: 0.85rem; color: #aaa;
-    }
-    #video-panel img { width: 100%; height: 100%; object-fit: contain; }
-
-    /* ── Detection list panel ───────────────────────── */
-    #list-panel {
-      flex: 1; min-width: 220px; display: flex; flex-direction: column;
-      background: #161616; border-radius: 10px; overflow: hidden;
-      border: 1px solid #2a2a2a;
-    }
-    #list-panel .panel-title {
-      padding: 10px 12px; background: #1a1a1a;
-      font-size: 0.9rem; font-weight: bold;
-      border-bottom: 1px solid #2a2a2a; display: flex;
-      justify-content: space-between; align-items: center;
-    }
-    #list-panel .panel-title #det-count {
-      font-size: 0.75rem; color: #4fc3f7; background: #0d2a3a;
-      padding: 2px 8px; border-radius: 10px;
-    }
-    #detection-list { flex: 1; overflow-y: auto; padding: 8px; }
-    #detection-list::-webkit-scrollbar { width: 5px; }
-    #detection-list::-webkit-scrollbar-thumb { background: #333; border-radius: 3px; }
-
-    .det-item {
-      padding: 7px 10px; margin-bottom: 5px; border-radius: 7px;
-      background: #1e1e1e; font-size: 0.84rem;
-      display: flex; justify-content: space-between; align-items: center;
-      border-left: 3px solid #4fc3f7;
-      animation: slideIn 0.25s ease;
-    }
-    .det-item .label { font-weight: bold; color: #4fc3f7; }
-    .det-item .meta { text-align: right; }
-    .det-item .conf { font-size: 0.8rem; color: #aaa; display: block; }
-    .det-item .ts   { font-size: 0.72rem; color: #555; display: block; }
-
-    .empty-msg { color: #444; text-align: center; margin-top: 40px; font-size: 0.85rem; }
-
-    @keyframes slideIn {
-      from { opacity: 0; transform: translateX(8px); }
-      to   { opacity: 1; transform: translateX(0); }
-    }
-  </style>
-</head>
-<body>
-  <header>
-    🤖 <span>Hailo AI HAT</span>&nbsp;— Real-time Object Detection (YOLOv8 · COCO)
-  </header>
-  <main>
-    <div id="video-panel">
-      <div class="panel-title">📷 Live Camera Feed</div>
-      <img src="/video_feed" alt="Live camera feed"/>
-    </div>
-    <div id="list-panel">
-      <div class="panel-title">
-        📋 Detected Objects
-        <span id="det-count">0</span>
-      </div>
-      <div id="detection-list">
-        <p class="empty-msg">Waiting for detections…</p>
-      </div>
-    </div>
-  </main>
-
-  <script>
-    const listEl  = document.getElementById('detection-list');
-    const countEl = document.getElementById('det-count');
-
-    const src = new EventSource('/detections');
-
-    src.onmessage = (e) => {
-      const dets = JSON.parse(e.data);
-      countEl.textContent = dets.length;
-
-      if (!dets.length) {
-        listEl.innerHTML = '<p class="empty-msg">No objects detected</p>';
-        return;
-      }
-
-      listEl.innerHTML = dets.map(d =>
-        `<div class="det-item">
-           <span class="label">${d.label}</span>
-           <span class="meta">
-             <span class="conf">${d.confidence}%</span>
-             <span class="ts">${d.time}</span>
-           </span>
-         </div>`
-      ).join('');
-    };
-
-    src.onerror = () => { console.warn('SSE connection lost, retrying…'); };
-  </script>
-</body>
-</html>"""
-
-# ---------------------------------------------------------------------------
 # Routes
 # ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
-    return render_template_string(_INDEX_HTML)
+    return render_template("index.html")
+
+
+@app.route("/info")
+def info():
+    return jsonify(model=os.path.basename(_model_path))
 
 
 @app.route("/video_feed")
@@ -351,11 +237,22 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     if args.model is None:
-        args.model = (
-            "/usr/share/hailo-models/yolov8m_h10.hef"
-            if hailo_architecture() == "HAILO10H"
-            else "/usr/share/hailo-models/yolov8s_h8l.hef"
-        )
+        # 1. Check for a local HEF file placed next to this script,
+        #    preferring the model that matches the detected Hailo architecture.
+        arch = hailo_architecture()
+        preferred = "yolov8m_h10.hef" if arch == "HAILO10H" else "yolov8s_h8l.hef"
+        for local_name in (preferred, "model.hef"):
+            local_path = os.path.join(_HERE, local_name)
+            if os.path.isfile(local_path):
+                args.model = local_path
+                break
+        # 2. Fall back to the system-installed Hailo models.
+        if args.model is None:
+            args.model = (
+                "/usr/share/hailo-models/yolov8m_h10.hef"
+                if arch == "HAILO10H"
+                else "/usr/share/hailo-models/yolov8s_h8l.hef"
+            )
 
     print(f"Model  : {args.model}")
     print(f"Labels : {args.labels}")
