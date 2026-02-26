@@ -1,3 +1,6 @@
 flask>=3.0.0
 picamera2
 opencv-python-headless
+paho-mqtt
+supervision
+loguru
