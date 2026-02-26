@@ -22,7 +22,33 @@ import time
 import cv2
 from flask import Flask, Response, jsonify, render_template, stream_with_context
 from picamera2 import Picamera2
-from picamera2.devices import Hailo, hailo_architecture
+try:
+    # picamera2 >= 0.3.21 exports hailo_architecture from the top-level devices package.
+    from picamera2.devices import Hailo, hailo_architecture
+except ImportError:
+    # Older picamera2 versions only export Hailo from the sub-package.
+    # Fall back to importing directly from the hailo sub-module.
+    try:
+        from picamera2.devices.hailo import Hailo, hailo_architecture
+    except ImportError:
+        # Last resort: Hailo class is available but hailo_architecture is not.
+        # Define it locally by calling hailortcli directly.
+        import subprocess
+        from picamera2.devices.hailo import Hailo
+
+        def hailo_architecture():
+            """Detect Hailo device architecture via hailortcli."""
+            try:
+                out = subprocess.run(
+                    ["hailortcli", "fw-control", "identify"],
+                    capture_output=True, text=True, check=True,
+                ).stdout
+                for line in out.splitlines():
+                    if "Device Architecture:" in line:
+                        return line.split(":")[-1].strip()
+            except (OSError, subprocess.CalledProcessError):
+                pass
+            return None
 
 # Directory that contains this script – used for local HEF / label look-ups.
 _HERE = os.path.dirname(os.path.abspath(__file__))
