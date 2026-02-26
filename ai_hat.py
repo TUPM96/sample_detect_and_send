@@ -116,20 +116,56 @@ def _open_camera(camera_index: int):
     return cap
 
 
+def _csi_camera_loop() -> None:
+    """Capture frames using Picamera2 (CSI ribbon camera via libcamera)."""
+    global global_frame
+    print("Đang dùng camera CSI (Picamera2)...")
+    try:
+        from picamera2 import Picamera2  # noqa: PLC0415
+        picam2 = Picamera2()
+        config = picam2.create_video_configuration(
+            main={"size": (1280, 720), "format": "BGR888"}
+        )
+        picam2.configure(config)
+        picam2.start()
+        try:
+            while True:
+                try:
+                    frame = picam2.capture_array()
+                    with frame_lock:
+                        global_frame = frame.copy()
+                except Exception as e:
+                    print(f"Lỗi đọc frame CSI: {e}")
+                time.sleep(0.03)
+        finally:
+            picam2.stop()
+    except ImportError:
+        print("Picamera2 không được cài đặt. Chạy: pip install picamera2")
+    except Exception as e:
+        print(f"Lỗi camera CSI: {e}")
+
+
 def camera_capture_loop(camera_index: int) -> None:
     global global_frame
     MAX_CONSECUTIVE_FAILURES = 30   # ~1 s at 30 fps before reconnect attempt
     RECONNECT_DELAY = 3             # seconds between reconnect attempts
+    MAX_RECONNECT_ATTEMPTS = 3      # fall back to CSI after this many failures
 
     cap = _open_camera(camera_index)
     if cap is None:
         print(f"Không mở được camera index {camera_index}")
+        _csi_camera_loop()
         return
 
     failures = 0
+    reconnect_attempts = 0
     while True:
         if cap is None:
             time.sleep(RECONNECT_DELAY)
+            reconnect_attempts += 1
+            if reconnect_attempts >= MAX_RECONNECT_ATTEMPTS:
+                _csi_camera_loop()
+                return
             cap = _open_camera(camera_index)
             if cap is None:
                 print(f"Không mở được camera index {camera_index}, thử lại sau {RECONNECT_DELAY}s...")
@@ -138,6 +174,7 @@ def camera_capture_loop(camera_index: int) -> None:
         ret, frame = cap.read()
         if ret:
             failures = 0
+            reconnect_attempts = 0
             with frame_lock:
                 global_frame = frame.copy()
             time.sleep(0.03)
