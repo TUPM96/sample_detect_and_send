@@ -100,23 +100,54 @@ class_names: list = []
 # ---------------------------------------------------------------------------
 
 
-def camera_capture_loop(camera_index: int) -> None:
-    global global_frame
-    cap = cv2.VideoCapture(camera_index)
+def _open_camera(camera_index: int):
+    """Open the camera and return a VideoCapture, or None on failure."""
+    cap = cv2.VideoCapture(camera_index, cv2.CAP_V4L2)
     if not cap.isOpened():
-        print(f"Không mở được camera index {camera_index}")
-        return
+        # Fallback: let OpenCV choose the backend
+        cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        return None
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    # Drain the initial buffered frames so we get a live image
+    for _ in range(5):
+        cap.read()
+    return cap
+
+
+def camera_capture_loop(camera_index: int) -> None:
+    global global_frame
+    MAX_CONSECUTIVE_FAILURES = 30   # ~1 s at 30 fps before reconnect attempt
+    RECONNECT_DELAY = 3             # seconds between reconnect attempts
+
+    cap = _open_camera(camera_index)
+    if cap is None:
+        print(f"Không mở được camera index {camera_index}")
+        return
+
+    failures = 0
     while True:
+        if cap is None:
+            time.sleep(RECONNECT_DELAY)
+            cap = _open_camera(camera_index)
+            if cap is None:
+                print(f"Không mở được camera index {camera_index}, thử lại sau {RECONNECT_DELAY}s...")
+            continue
+
         ret, frame = cap.read()
-        if not ret:
-            print("Không lấy được frame, dừng thread camera.")
-            break
-        with frame_lock:
-            global_frame = frame.copy()
-        time.sleep(0.03)
-    cap.release()
+        if ret:
+            failures = 0
+            with frame_lock:
+                global_frame = frame.copy()
+            time.sleep(0.03)
+        else:
+            failures += 1
+            if failures >= MAX_CONSECUTIVE_FAILURES:
+                print(f"Camera index {camera_index}: quá nhiều lỗi liên tiếp, thử kết nối lại...")
+                cap.release()
+                cap = None
+                failures = 0
 
 
 def _get_latest_frame():
