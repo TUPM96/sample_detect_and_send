@@ -95,6 +95,11 @@ Script tự tìm file `.hef` theo thứ tự:
 2. `model.hef` trong cùng thư mục
 3. `/usr/share/hailo-models/` (system path)
 
+> **Model côn trùng**: dùng `contrung_model.hef` + `data/contrung_labels.txt` nếu muốn phát hiện côn trùng:
+> ```bash
+> python3 ai_hat.py -m contrung_model.hef -l data/contrung_labels.txt
+> ```
+
 ---
 
 ## 3. Chạy test GPS
