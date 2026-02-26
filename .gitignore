@@ -1,4 +1,4 @@
-# Hailo model files (binary, place alongside ai_hat.py manually)
+# Hailo model files (binary – place alongside ai_hat.py manually)
 *.hef
 
 # Python
@@ -9,6 +9,6 @@ __pycache__/
 venv/
 env/
 
-# IDE
+# IDE / editor
 .idea/
 .vscode/

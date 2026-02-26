@@ -213,8 +213,8 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "-l", "--labels",
-        default="coco.txt",
-        help="Path to class labels file (default: coco.txt).",
+        default="data/coco.txt",
+        help="Path to class labels file (default: data/coco.txt).",
     )
     parser.add_argument(
         "-s", "--score_thresh",
