@@ -1,10 +1,16 @@
 #!/usr/bin/env python3
 """
-ai_hat.py – Real-time object detection web app using Hailo AI HAT.
+ai_hat.py – Insect detection web app using Hailo AI HAT.
 
-Streams annotated live camera video (MJPEG) on the left panel and shows a
-real-time list of detected COCO objects on the right panel, all served from a
-lightweight Flask web server.
+Rewritten based on app_realtime.py architecture:
+  - HailoAsyncInference (utils.py) for inference
+  - cv2.VideoCapture for camera
+  - ByteTrack tracking via supervision
+  - MQTT for publishing detections and controlling hardware
+  - Detection logging (CSV + image capture)
+  - Conveyor auto-control based on detected insects
+  - LED / UVA light control via MQTT
+  - FPS + resolution overlay on video stream
 
 ⚠  This server binds to 0.0.0.0 and is intended for use on a trusted local
    network only.  Do not expose it directly to the public internet.
@@ -14,186 +20,485 @@ Usage:
 """
 
 import argparse
+import glob
 import json
 import os
+import queue
 import threading
 import time
+import uuid
+from collections import Counter, defaultdict, deque
+from datetime import datetime
 
 import cv2
-from flask import Flask, Response, jsonify, render_template, stream_with_context
-from picamera2 import Picamera2
-from picamera2.devices import Hailo, hailo_architecture
+import numpy as np
+import paho.mqtt.client as mqtt
+import supervision as sv
+from flask import Flask, Response, jsonify, render_template, request
 
-# Directory that contains this script – used for local HEF / label look-ups.
+from utils import HailoAsyncInference
+
+# ---------------------------------------------------------------------------
+# Paths & constants
+# ---------------------------------------------------------------------------
+
 _HERE = os.path.dirname(os.path.abspath(__file__))
+
+PIXEL_TO_MM = 0.05
+
+CAPTURE_DIR = os.path.join(_HERE, "captures")
+LOG_DIR = os.path.join(_HERE, "logs")
+os.makedirs(CAPTURE_DIR, exist_ok=True)
+os.makedirs(LOG_DIR, exist_ok=True)
+
+CONFIG_FILE = os.path.join(_HERE, "config.json")
+DEFAULT_CONFIG = {"speed": 255, "time": 1000, "auto_stop_delay": 5}
+
+# ---------------------------------------------------------------------------
+# MQTT settings
+# ---------------------------------------------------------------------------
+
+MQTT_HOST = "103.146.22.13"
+MQTT_PORT = 1883
+MQTT_USER = "user1"
+MQTT_PASS = "12345678"
+MQTT_TOPIC = "doan/contrung/control"
+SENSOR_TOPIC = "doan/contrung/sensor"
+MQTT_SCHEDULE_RESP = "doan/contrung/schedule"
+MQTT_DETECT_RESULT = "doan/contrung/result"
+
+# ---------------------------------------------------------------------------
+# Global state
+# ---------------------------------------------------------------------------
+
+global_frame = None
+frame_lock = threading.Lock()
+
+# supervision tracking (module-level so state persists across frames)
+tracker = sv.ByteTrack()
+box_annotator = sv.RoundBoxAnnotator()
+label_annotator = sv.LabelAnnotator()
+
+sensor_data_buffer: deque = deque(maxlen=200)
+schedule_cache: list = []
+
+logged_tracker_ids: set = set()
+conveyor_running: bool = False
+last_insect_time: float = time.time()
+_conveyor_lock = threading.Lock()   # protects conveyor_running / last_insect_time / logged_tracker_ids
+# Populated after CLI arg parsing
+input_queue: queue.Queue = None
+output_queue: queue.Queue = None
+hailo_inference: HailoAsyncInference = None
+class_names: list = []
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+
+
+def load_config() -> dict:
+    if not os.path.exists(CONFIG_FILE):
+        _write_config(DEFAULT_CONFIG)
+    with open(CONFIG_FILE, "r") as f:
+        return json.load(f)
+
+
+def _write_config(cfg: dict) -> None:
+    with open(CONFIG_FILE, "w") as f:
+        json.dump(cfg, f)
+
+# ---------------------------------------------------------------------------
+# Camera capture thread
+# ---------------------------------------------------------------------------
+
+
+def camera_capture_loop(camera_index: int) -> None:
+    global global_frame
+    cap = cv2.VideoCapture(camera_index)
+    if not cap.isOpened():
+        print(f"Không mở được camera index {camera_index}")
+        return
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            print("Không lấy được frame, dừng thread camera.")
+            break
+        with frame_lock:
+            global_frame = frame.copy()
+        time.sleep(0.03)
+    cap.release()
+
+
+def _get_latest_frame():
+    with frame_lock:
+        return global_frame.copy() if global_frame is not None else None
+
+# ---------------------------------------------------------------------------
+# Hailo detection + tracking
+# ---------------------------------------------------------------------------
+
+
+def extract_detections(hailo_output, h: int, w: int, threshold: float) -> dict:
+    """Convert HailoRT postprocess output to arrays for supervision."""
+    xyxy, confidence, class_id = [], [], []
+    for i, detections in enumerate(hailo_output):
+        if len(detections) == 0:
+            continue
+        for det in detections:
+            bbox, score = det[:4], det[4]
+            if score < threshold:
+                continue
+            # Hailo output: (y_min, x_min, y_max, x_max) normalised 0-1
+            bbox[0], bbox[1], bbox[2], bbox[3] = (
+                bbox[1] * w, bbox[0] * h,
+                bbox[3] * w, bbox[2] * h,
+            )
+            xyxy.append(bbox)
+            confidence.append(score)
+            class_id.append(i)
+    return {
+        "xyxy": np.array(xyxy, dtype=np.float32).reshape(-1, 4),
+        "confidence": np.array(confidence, dtype=np.float32),
+        "class_id": np.array(class_id, dtype=np.int32),
+    }
+
+
+def process_frame(frame: np.ndarray, threshold: float):
+    """Run Hailo inference + ByteTrack on one frame.
+
+    Returns (annotated_frame, insects_list).
+    """
+    model_h, model_w, _ = hailo_inference.get_input_shape()
+    input_frame = cv2.resize(frame, (model_w, model_h))
+    input_queue.put([input_frame])
+    _, hailo_results = output_queue.get()
+    if len(hailo_results) == 1:
+        hailo_results = hailo_results[0]
+
+    dets = extract_detections(hailo_results, frame.shape[0], frame.shape[1], threshold)
+
+    sv_dets = sv.Detections(
+        xyxy=dets["xyxy"],
+        confidence=dets["confidence"],
+        class_id=dets["class_id"],
+    )
+    sv_dets = tracker.update_with_detections(sv_dets)
+
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    insects_list = []
+    labels = []
+    for cid, tid, box in zip(sv_dets.class_id, sv_dets.tracker_id, sv_dets.xyxy):
+        name = class_names[cid]
+        x1, y1, x2, y2 = box
+        width_mm = round(abs(x2 - x1) * PIXEL_TO_MM, 2)
+        height_mm = round(abs(y2 - y1) * PIXEL_TO_MM, 2)
+        insects_list.append({
+            "tracker_id": int(tid) if tid is not None else None,
+            "class": name,
+            "width_mm": width_mm,
+            "height_mm": height_mm,
+            "detected_at": now,
+        })
+        labels.append(f"#{tid} {name} {width_mm}x{height_mm}mm")
+
+    annotated = box_annotator.annotate(scene=frame.copy(), detections=sv_dets)
+    annotated = label_annotator.annotate(scene=annotated, detections=sv_dets, labels=labels)
+    return annotated, insects_list
+
+# ---------------------------------------------------------------------------
+# MQTT helpers
+# ---------------------------------------------------------------------------
+
+
+def _mqtt_publish(payload: dict, topic: str = MQTT_TOPIC) -> None:
+    try:
+        client = mqtt.Client()
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+        client.connect(MQTT_HOST, MQTT_PORT, 60)
+        client.publish(topic, json.dumps(payload, ensure_ascii=False))
+        client.disconnect()
+    except Exception as e:
+        print(f"MQTT publish error: {e}")
+
+
+def send_detect_mqtt(insects_list: list) -> None:
+    _mqtt_publish({"insects": insects_list}, MQTT_DETECT_RESULT)
+
+
+def send_conveyor_control(speed: int, time_ms: int) -> None:
+    _mqtt_publish({"speed": speed, "time": time_ms})
+
+# ---------------------------------------------------------------------------
+# Detection logging
+# ---------------------------------------------------------------------------
+
+
+def log_detection(dt: datetime, counts: Counter, image_path: str, detect_id: str) -> None:
+    log_file = os.path.join(LOG_DIR, f"detect_{dt.strftime('%Y-%m-%d')}.csv")
+    total = sum(counts.values())
+    with open(log_file, "a", encoding="utf-8") as f:
+        f.write(
+            f"{detect_id},{dt.strftime('%Y-%m-%d %H:%M:%S')},{total},"
+            f"{json.dumps(dict(counts), ensure_ascii=False)},{image_path}\n"
+        )
+
+# ---------------------------------------------------------------------------
+# MQTT subscribers
+# ---------------------------------------------------------------------------
+
+
+def _on_sensor_message(client, userdata, msg):
+    try:
+        data = json.loads(msg.payload.decode())
+        sensor_data_buffer.append({
+            "time": datetime.now().strftime("%H:%M:%S"),
+            "temperature": data.get("temperature"),
+            "humidity": data.get("humidity"),
+            "light": data.get("light"),
+        })
+    except Exception as e:
+        print(f"Sensor MQTT parse error: {e}")
+
+
+def _on_schedule_resp(client, userdata, msg):
+    global schedule_cache
+    try:
+        data = json.loads(msg.payload.decode())
+        if isinstance(data, list):
+            schedule_cache = data
+    except Exception:
+        pass
+
+
+def start_mqtt_subscribers() -> None:
+    def _run(topic, on_message):
+        client = mqtt.Client()
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+        try:
+            client.connect(MQTT_HOST, MQTT_PORT, 60)
+            client.subscribe(topic)
+            client.on_message = on_message
+            client.loop_forever()
+        except Exception as e:
+            print(f"MQTT subscriber [{topic}] error: {e}")
+
+    threading.Thread(target=_run, args=(SENSOR_TOPIC, _on_sensor_message), daemon=True).start()
+    threading.Thread(target=_run, args=(MQTT_SCHEDULE_RESP, _on_schedule_resp), daemon=True).start()
 
 # ---------------------------------------------------------------------------
 # Flask application
 # ---------------------------------------------------------------------------
+
 app = Flask(__name__)
 
-# Shared state written by the inference thread, read by HTTP route handlers.
-_lock = threading.Lock()
-_latest_jpeg: bytes = b""
-_current_detections: list = []
-_model_path: str = ""
-
-# Events that wake streaming threads when new data is available.
-_frame_event = threading.Event()
-_detection_event = threading.Event()
-
-# ---------------------------------------------------------------------------
-# Helper – extract bounding boxes from Hailo postprocess output
-# ---------------------------------------------------------------------------
-
-def extract_detections(hailo_output, video_w: int, video_h: int,
-                        class_names: list, threshold: float) -> list:
-    """Return a list of detection dicts from the HailoRT postprocess output."""
-    results = []
-    for class_id, detections in enumerate(hailo_output):
-        for det in detections:
-            score = float(det[4])
-            if score >= threshold:
-                # Hailo postprocess output order: (y_min, x_min, y_max, x_max), normalised 0–1
-                y0, x0, y1, x1 = det[:4]
-                results.append({
-                    "label": class_names[class_id],
-                    "confidence": round(score * 100),
-                    "bbox": [
-                        int(x0 * video_w), int(y0 * video_h),
-                        int(x1 * video_w), int(y1 * video_h),
-                    ],
-                    "time": time.strftime("%H:%M:%S"),
-                })
-    return results
-
-# ---------------------------------------------------------------------------
-# Inference thread – captures frames, runs Hailo, encodes JPEG
-# ---------------------------------------------------------------------------
-
-def inference_loop(model_path: str, labels_path: str,
-                   score_thresh: float, camera_num: int) -> None:
-    global _latest_jpeg, _current_detections, _model_path
-    _model_path = model_path
-
-    with open(labels_path, "r", encoding="utf-8") as f:
-        class_names = f.read().splitlines()
-
-    with Hailo(model_path) as hailo:
-        model_h, model_w, _ = hailo.get_input_shape()
-        video_w, video_h = 1280, 720
-
-        with Picamera2(camera_num) as picam2:
-            main_cfg = {"size": (video_w, video_h), "format": "RGB888"}
-            lores_cfg = {"size": (model_w, model_h), "format": "RGB888"}
-            config = picam2.create_preview_configuration(
-                main_cfg,
-                lores=lores_cfg,
-                controls={"FrameRate": 30},
-            )
-            picam2.configure(config)
-            picam2.start()
-
-            while True:
-                # Capture main and lores frames atomically
-                request = picam2.capture_request()
-                main_frame = request.make_array("main")
-                lores_frame = request.make_array("lores")
-                request.release()
-
-                # Run inference on the low-resolution frame
-                results = hailo.run(lores_frame)
-                dets = extract_detections(
-                    results, video_w, video_h, class_names, score_thresh
-                )
-
-                # Draw bounding boxes on the main frame
-                annotated = main_frame.copy()
-                for d in dets:
-                    x0, y0, x1, y1 = d["bbox"]
-                    label = f"{d['label']} {d['confidence']}%"
-                    cv2.rectangle(annotated, (x0, y0), (x1, y1), (0, 255, 0), 2)
-                    cv2.putText(
-                        annotated, label,
-                        (x0, max(y0 - 6, 14)),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.55,
-                        (0, 255, 0), 1, cv2.LINE_AA,
-                    )
-
-                # JPEG-encode (convert RGB → BGR for OpenCV)
-                _, buf = cv2.imencode(
-                    ".jpg", cv2.cvtColor(annotated, cv2.COLOR_RGB2BGR),
-                    [cv2.IMWRITE_JPEG_QUALITY, 80],
-                )
-
-                with _lock:
-                    _latest_jpeg = buf.tobytes()
-                    _current_detections = dets
-                _frame_event.set()
-                _detection_event.set()
-
-# ---------------------------------------------------------------------------
-# MJPEG generator
-# ---------------------------------------------------------------------------
-
-def _mjpeg_generator():
-    while True:
-        _frame_event.wait(timeout=1.0)
-        _frame_event.clear()
-        with _lock:
-            frame = _latest_jpeg
-        if frame:
-            yield (
-                b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n"
-                + frame
-                + b"\r\n"
-            )
-
-# ---------------------------------------------------------------------------
-# SSE detection-list generator
-# ---------------------------------------------------------------------------
-
-def _sse_generator():
-    last_dets: list = []
-    while True:
-        _detection_event.wait(timeout=1.0)
-        _detection_event.clear()
-        with _lock:
-            current = list(_current_detections)
-        if current != last_dets:
-            yield f"data: {json.dumps(current)}\n\n"
-            last_dets = current
-
-# ---------------------------------------------------------------------------
-# Routes
-# ---------------------------------------------------------------------------
 
 @app.route("/")
 def index():
     return render_template("index.html")
 
 
-@app.route("/info")
-def info():
-    return jsonify(model=os.path.basename(_model_path))
+@app.route("/camera_stream")
+@app.route("/video_feed")          # backward-compatible alias
+def camera_stream():
+    score_thresh = app.config.get("SCORE_THRESH", 0.5)
+
+    def gen():
+        global conveyor_running, last_insect_time
+        frame_count = 0
+        last_fps_time = time.time()
+        fps = 0.0
+        resolution = None
+
+        while True:
+            frame = _get_latest_frame()
+            if frame is not None:
+                frame_draw, insects_list = process_frame(frame.copy(), score_thresh)
+
+                # Auto conveyor control (protected by lock)
+                now = time.time()
+                cfg = load_config()
+                auto_stop_delay = cfg.get("auto_stop_delay", 5)
+                with _conveyor_lock:
+                    if insects_list:
+                        last_insect_time = now
+                        if not conveyor_running:
+                            send_conveyor_control(cfg.get("speed", 185), -1)  # -1 = run continuously
+                            conveyor_running = True
+                            print("Bắt đầu băng tải vì phát hiện côn trùng")
+                    else:
+                        if conveyor_running and (now - last_insect_time > auto_stop_delay):
+                            send_conveyor_control(0, 0)
+                            conveyor_running = False
+                            print(f"Dừng băng tải sau {auto_stop_delay}s không phát hiện côn trùng")
+
+                # FPS / resolution overlay
+                frame_count += 1
+                current_time = time.time()
+                if resolution is None:
+                    h, w = frame_draw.shape[:2]
+                    resolution = f"{w}x{h}"
+                if current_time - last_fps_time >= 1.0:
+                    fps = frame_count / (current_time - last_fps_time)
+                    frame_count = 0
+                    last_fps_time = current_time
+                cv2.putText(
+                    frame_draw,
+                    f"Resolution: {resolution} | FPS: {fps:.2f}",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA,
+                )
+
+                # MQTT – only send newly-seen tracker IDs (protected by lock)
+                new_insects = []
+                new_tids: set = set()
+                for item in insects_list:
+                    tid = item.get("tracker_id")
+                    if tid is not None and tid not in new_tids:
+                        with _conveyor_lock:
+                            already_logged = tid in logged_tracker_ids
+                        if not already_logged:
+                            new_insects.append(item)
+                            new_tids.add(tid)
+                if new_insects:
+                    counts = Counter(item["class"] for item in new_insects)
+                    detect_id = str(uuid.uuid4())
+                    image_path = os.path.join(CAPTURE_DIR, f"{detect_id}.jpg")
+                    cv2.imwrite(image_path, frame_draw)
+                    log_detection(datetime.now(), counts, image_path, detect_id)
+                    send_detect_mqtt(new_insects)
+                    with _conveyor_lock:
+                        logged_tracker_ids.update(new_tids)
+
+                _, buf = cv2.imencode(".jpg", frame_draw)
+                yield (
+                    b"--frame\r\n"
+                    b"Content-Type: image/jpeg\r\n\r\n"
+                    + buf.tobytes()
+                    + b"\r\n"
+                )
+            time.sleep(0.03)
+
+    return Response(gen(), mimetype="multipart/x-mixed-replace; boundary=frame")
 
 
-@app.route("/video_feed")
-def video_feed():
-    return Response(
-        stream_with_context(_mjpeg_generator()),
-        mimetype="multipart/x-mixed-replace; boundary=frame",
-    )
+@app.route("/stat_counts")
+def stat_counts():
+    log_files = glob.glob(os.path.join(LOG_DIR, "detect_*.csv"))
+    stat: dict = defaultdict(Counter)
+    for file in log_files:
+        try:
+            with open(file, encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split(",")
+                    if len(parts) < 5:
+                        continue
+                    day = parts[1].split(" ")[0]
+                    try:
+                        counts = json.loads(parts[3])
+                        for k, v in counts.items():
+                            stat[day][k] += int(v)
+                    except Exception:
+                        continue
+        except Exception:
+            continue
+    days = sorted(stat.keys())
+    all_types = sorted({k for ct in stat.values() for k in ct})
+    colors = ["#f44336", "#2196f3", "#4caf50", "#ff9800", "#9c27b0", "#009688", "#e91e63", "#607d8b"]
+    datasets = [
+        {
+            "label": t,
+            "data": [stat[d].get(t, 0) for d in days],
+            "backgroundColor": colors[i % len(colors)],
+        }
+        for i, t in enumerate(all_types)
+    ]
+    return jsonify({"labels": days, "datasets": datasets})
 
 
-@app.route("/detections")
-def detections_sse():
-    return Response(
-        stream_with_context(_sse_generator()),
-        mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+@app.route("/sensor_data")
+def sensor_data():
+    return jsonify(list(sensor_data_buffer))
+
+
+@app.route("/control", methods=["POST"])
+def control():
+    try:
+        data = request.get_json()
+        _mqtt_publish(data)
+        return jsonify({"status": "ok", "msg": "Đã gửi qua MQTT", "data": data})
+    except Exception as e:
+        return jsonify({"status": "fail", "msg": str(e)}), 400
+
+
+@app.route("/get_config")
+def get_config():
+    return jsonify(load_config())
+
+
+@app.route("/save_config", methods=["POST"])
+def save_config_api():
+    try:
+        data = request.get_json()
+        cfg = {
+            "speed": int(data.get("speed", 185)),
+            "ddos": int(data.get("ddos", 5)),
+            "auto_stop_delay": float(data.get("auto_stop_delay", 5)),
+        }
+        _write_config(cfg)
+        return jsonify({"status": "ok", "msg": "Đã lưu cấu hình!"})
+    except Exception as e:
+        return jsonify({"status": "fail", "msg": str(e)}), 400
+
+
+@app.route("/list_schedule")
+def list_schedule():
+    try:
+        client = mqtt.Client()
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+        client.connect(MQTT_HOST, MQTT_PORT, 60)
+        client.publish(MQTT_TOPIC, json.dumps({"action": "get_schedule"}))
+        client.disconnect()
+    except Exception as e:
+        print(f"list_schedule MQTT error: {e}")
+    for _ in range(20):
+        if schedule_cache:
+            break
+        time.sleep(0.1)
+    return jsonify(schedule_cache)
+
+
+def _led_action(payload: dict, ok_msg: str):
+    try:
+        client = mqtt.Client()
+        client.username_pw_set(MQTT_USER, MQTT_PASS)
+        client.connect(MQTT_HOST, MQTT_PORT, 60)
+        client.publish(MQTT_TOPIC, json.dumps(payload))
+        client.disconnect()
+        return jsonify({"msg": ok_msg})
+    except Exception as e:
+        return jsonify({"msg": f"Lỗi MQTT: {e}"}), 500
+
+
+@app.route("/turn_on_led", methods=["POST"])
+def turn_on_led():
+    return _led_action({"led1": "on"}, "Đã bật đèn!")
+
+
+@app.route("/turn_off_led", methods=["POST"])
+def turn_off_led():
+    return _led_action({"led1": "off"}, "Đã tắt đèn!")
+
+
+@app.route("/turn_on_uva", methods=["POST"])
+def turn_on_uva():
+    return _led_action({"led2": "on"}, "Đã bật đèn UVA!")
+
+
+@app.route("/turn_off_uva", methods=["POST"])
+def turn_off_uva():
+    return _led_action({"led2": "off"}, "Đã tắt đèn UVA!")
 
 # ---------------------------------------------------------------------------
 # Entry point
@@ -201,58 +506,52 @@ def detections_sse():
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Hailo AI HAT – Real-time object detection web app"
+        description="Hailo AI HAT – Insect detection web app"
     )
     parser.add_argument(
         "-m", "--model",
         default=None,
-        help=(
-            "Path to HEF model file. "
-            "Defaults to yolov8s_h8l.hef (Hailo-8L) or yolov8m_h10.hef (Hailo-10H)."
-        ),
+        help="Path to HEF model file (default: auto-detect).",
     )
     parser.add_argument(
         "-l", "--labels",
-        default="data/coco.txt",
-        help="Path to class labels file (default: data/coco.txt).",
+        default=os.path.join(_HERE, "data", "contrung_labels.txt"),
+        help="Path to class labels file (default: data/contrung_labels.txt).",
     )
     parser.add_argument(
         "-s", "--score_thresh",
         type=float,
         default=0.5,
-        help="Detection confidence threshold, 0–1 (default: 0.5).",
+        help="Detection confidence threshold 0–1 (default: 0.5).",
     )
     parser.add_argument(
         "-p", "--port",
         type=int,
-        default=8080,
-        help="Web server port (default: 8080).",
+        default=5000,
+        help="Web server port (default: 5000).",
     )
     parser.add_argument(
         "-c", "--camera",
         type=int,
         default=0,
-        help="Picamera2 camera index (default: 0).",
+        help="Camera index for cv2.VideoCapture (default: 0).",
     )
     args = parser.parse_args()
 
+    # Resolve model path
     if args.model is None:
-        # 1. Check for a local HEF file placed next to this script,
-        #    preferring the model that matches the detected Hailo architecture.
-        arch = hailo_architecture()
-        preferred = "yolov8m_h10.hef" if arch == "HAILO10H" else "yolov8s_h8l.hef"
-        for local_name in (preferred, "model.hef"):
-            local_path = os.path.join(_HERE, local_name)
-            if os.path.isfile(local_path):
-                args.model = local_path
+        candidates = [
+            os.path.join(_HERE, "yolov8n.hef"),
+            os.path.join(_HERE, "hailo_models", "yolov8s_h8l.hef"),
+            "/usr/share/hailo-models/yolov8n.hef",
+            "/usr/share/hailo-models/yolov8s_h8l.hef",
+        ]
+        for path in candidates:
+            if os.path.isfile(path):
+                args.model = path
                 break
-        # 2. Fall back to the system-installed Hailo models.
         if args.model is None:
-            args.model = (
-                "/usr/share/hailo-models/yolov8m_h10.hef"
-                if arch == "HAILO10H"
-                else "/usr/share/hailo-models/yolov8s_h8l.hef"
-            )
+            args.model = "/usr/share/hailo-models/yolov8s_h8l.hef"
 
     print(f"Model  : {args.model}")
     print(f"Labels : {args.labels}")
@@ -260,12 +559,30 @@ if __name__ == "__main__":
     print(f"Camera : {args.camera}")
     print(f"Server : http://0.0.0.0:{args.port}")
 
-    # Start inference in a background daemon thread
-    t = threading.Thread(
-        target=inference_loop,
-        args=(args.model, args.labels, args.score_thresh, args.camera),
-        daemon=True,
+    # Load class labels
+    with open(args.labels, "r", encoding="utf-8") as f:
+        class_names = [line.strip() for line in f]
+
+    # Initialise Hailo async inference
+    input_queue = queue.Queue()
+    output_queue = queue.Queue()
+    hailo_inference = HailoAsyncInference(
+        hef_path=args.model,
+        input_queue=input_queue,
+        output_queue=output_queue,
     )
-    t.start()
+    threading.Thread(target=hailo_inference.run, daemon=True).start()
+
+    # Store score threshold for use in routes
+    app.config["SCORE_THRESH"] = args.score_thresh
+
+    # Start MQTT subscribers (non-fatal if broker unreachable)
+    start_mqtt_subscribers()
+
+    # Stop conveyor at startup
+    send_conveyor_control(0, 0)
+
+    # Start camera capture thread
+    threading.Thread(target=camera_capture_loop, args=(args.camera,), daemon=True).start()
 
     app.run(host="0.0.0.0", port=args.port, threaded=True)
