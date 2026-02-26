@@ -89,6 +89,14 @@ sensor_data_buffer: deque = deque(maxlen=200)
 logged_tracker_ids: set = set()
 _tracker_lock = threading.Lock()   # protects logged_tracker_ids
 
+# Shared state for the /detections endpoint
+_display_state: dict = {"detections": [], "fps": 0.0, "model": ""}
+_display_lock = threading.Lock()
+
+# GPS state (updated by background thread)
+_gps_state: dict = {"lat": None, "lon": None}
+_gps_lock = threading.Lock()
+
 # Populated after CLI arg parsing
 input_queue: queue.Queue = None
 output_queue: queue.Queue = None
@@ -245,19 +253,23 @@ def process_frame(frame: np.ndarray, threshold: float):
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     detections_list = []
     labels = []
-    for cid, tid, box in zip(sv_dets.class_id, sv_dets.tracker_id, sv_dets.xyxy):
+    for cid, tid, box, conf in zip(
+        sv_dets.class_id, sv_dets.tracker_id, sv_dets.xyxy, sv_dets.confidence
+    ):
         name = class_names[cid]
+        conf_pct = round(float(conf) * 100, 1)
         x1, y1, x2, y2 = box
         width_mm = round(abs(x2 - x1) * PIXEL_TO_MM, 2)
         height_mm = round(abs(y2 - y1) * PIXEL_TO_MM, 2)
         detections_list.append({
             "tracker_id": int(tid) if tid is not None else None,
             "class": name,
+            "confidence": round(float(conf), 4),
             "width_mm": width_mm,
             "height_mm": height_mm,
             "detected_at": now,
         })
-        labels.append(f"#{tid} {name} {width_mm}x{height_mm}mm")
+        labels.append(f"#{tid} {name} {conf_pct}%")
 
     annotated = box_annotator.annotate(scene=frame.copy(), detections=sv_dets)
     annotated = label_annotator.annotate(scene=annotated, detections=sv_dets, labels=labels)
@@ -315,6 +327,59 @@ def start_mqtt_subscribers() -> None:
     threading.Thread(target=_run, args=(SENSOR_TOPIC, _on_sensor_message), daemon=True).start()
 
 # ---------------------------------------------------------------------------
+# GPS thread
+# ---------------------------------------------------------------------------
+
+GPS_PORT = "/dev/ttyAMA0"
+GPS_BAUD = 9600
+
+
+def _gps_reader_loop() -> None:
+    """Background thread: read NMEA sentences and update _gps_state."""
+    try:
+        import pynmea2  # noqa: PLC0415
+        import serial   # noqa: PLC0415
+    except ImportError:
+        print("GPS: pynmea2 or pyserial not installed – GPS disabled.")
+        return
+
+    try:
+        ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=1)
+    except Exception as e:
+        print(f"GPS: cannot open {GPS_PORT}: {e}")
+        return
+
+    print(f"GPS: reading from {GPS_PORT} at {GPS_BAUD} baud")
+    while True:
+        try:
+            line = ser.readline().decode("ascii", errors="replace").strip()
+        except Exception as e:
+            print(f"GPS read error: {e}")
+            time.sleep(1)
+            continue
+
+        if not line.startswith("$"):
+            continue
+        try:
+            msg = pynmea2.parse(line)
+        except pynmea2.ParseError:
+            continue
+
+        lat = lon = None
+        if msg.sentence_type in ("GGA", "RMC"):
+            lat = getattr(msg, "latitude", None)
+            lon = getattr(msg, "longitude", None)
+
+        if lat is not None and lon is not None:
+            with _gps_lock:
+                _gps_state["lat"] = round(float(lat), 6)
+                _gps_state["lon"] = round(float(lon), 6)
+
+
+def start_gps_thread() -> None:
+    threading.Thread(target=_gps_reader_loop, daemon=True).start()
+
+# ---------------------------------------------------------------------------
 # Flask application
 # ---------------------------------------------------------------------------
 
@@ -352,11 +417,17 @@ def camera_stream():
                     fps = frame_count / (current_time - last_fps_time)
                     frame_count = 0
                     last_fps_time = current_time
+                    with _display_lock:
+                        _display_state["fps"] = round(fps, 1)
                 cv2.putText(
                     frame_draw,
                     f"Resolution: {resolution} | FPS: {fps:.2f}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 0), 2, cv2.LINE_AA,
                 )
+
+                # Update detection list for /detections endpoint
+                with _display_lock:
+                    _display_state["detections"] = detections_list
 
                 # MQTT – only send newly-seen tracker IDs
                 new_detections = []
@@ -389,6 +460,19 @@ def camera_stream():
 @app.route("/sensor_data")
 def sensor_data():
     return jsonify(list(sensor_data_buffer))
+
+
+@app.route("/detections")
+def detections_route():
+    with _display_lock:
+        payload = {
+            "detections": list(_display_state["detections"]),
+            "fps": _display_state["fps"],
+            "model": _display_state["model"],
+        }
+    with _gps_lock:
+        payload["gps"] = {"lat": _gps_state["lat"], "lon": _gps_state["lon"]}
+    return jsonify(payload)
 
 
 @app.route("/control", methods=["POST"])
@@ -454,6 +538,7 @@ if __name__ == "__main__":
             args.model = "/usr/share/hailo-models/yolov8s_h8l.hef"
 
     print(f"Model  : {args.model}")
+    _display_state["model"] = os.path.basename(args.model)
     print(f"Labels : {args.labels or 'COCO 80 (built-in)'}")
     print(f"Thresh : {args.score_thresh}")
     print(f"Camera : {args.camera}")
@@ -481,6 +566,9 @@ if __name__ == "__main__":
 
     # Start MQTT subscribers (non-fatal if broker unreachable)
     start_mqtt_subscribers()
+
+    # Start GPS reader thread (non-fatal if serial port unavailable)
+    start_gps_thread()
 
     # Start camera capture thread
     threading.Thread(target=camera_capture_loop, args=(args.camera,), daemon=True).start()

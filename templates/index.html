@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8"/>
   <meta name="viewport" content="width=device-width, initial-scale=1"/>
-  <title>Hailo AI HAT – Phát hiện côn trùng</title>
+  <title>Hailo AI HAT – Phát hiện object thời gian thực</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -20,47 +20,35 @@
     header {
       display: flex;
       align-items: center;
-      gap: 10px;
+      gap: 12px;
       padding: 10px 18px;
       background: #1a1a2e;
+      border-bottom: 2px solid #4fc3f7;
+    }
+    header .title {
       font-size: 1.1rem;
       font-weight: bold;
-      border-bottom: 2px solid #4fc3f7;
-      flex-wrap: wrap;
     }
-    header span { color: #4fc3f7; }
-
-    /* ── Control buttons ─────────────────────────────────── */
-    .controls {
+    header .title span { color: #4fc3f7; }
+    header .meta {
       margin-left: auto;
-      display: flex;
-      gap: 8px;
-      flex-wrap: wrap;
+      font-size: 0.85rem;
+      color: #aaa;
     }
-    .btn {
-      padding: 5px 12px;
-      border: none;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 0.8rem;
-      font-weight: bold;
-      transition: opacity 0.2s;
-    }
-    .btn:hover { opacity: 0.85; }
-    .btn-on  { background: #4fc3f7; color: #000; }
-    .btn-off { background: #444;    color: #eee; }
-    .btn-uva-on  { background: #9c27b0; color: #fff; }
-    .btn-uva-off { background: #555;    color: #eee; }
+    header .meta strong { color: #4fc3f7; }
 
-    /* ── Main video area ─────────────────────────────────── */
+    /* ── Main two-column layout ──────────────────────────── */
     main {
       display: flex;
       flex: 1;
       overflow: hidden;
+      gap: 8px;
       padding: 8px;
     }
+
+    /* Left: video panel */
     #video-panel {
-      flex: 1;
+      flex: 3;
       display: flex;
       flex-direction: column;
       background: #000;
@@ -79,25 +67,62 @@
       object-fit: contain;
     }
 
-    /* ── Status bar ──────────────────────────────────────── */
-    #status-bar {
-      padding: 5px 14px;
+    /* Right: detection list panel */
+    #detect-panel {
+      flex: 1;
+      min-width: 220px;
+      max-width: 300px;
+      display: flex;
+      flex-direction: column;
       background: #111;
-      font-size: 0.78rem;
-      color: #777;
-      border-top: 1px solid #222;
+      border-radius: 10px;
+      overflow: hidden;
     }
+    #detect-panel .panel-title {
+      padding: 6px 12px;
+      background: #1a1a2e;
+      font-size: 0.85rem;
+      color: #aaa;
+      border-bottom: 1px solid #333;
+    }
+    #detect-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 6px;
+    }
+    .det-item {
+      padding: 7px 10px;
+      margin-bottom: 5px;
+      background: #1a1a2e;
+      border-radius: 7px;
+      font-size: 0.82rem;
+      border-left: 3px solid #4fc3f7;
+    }
+    .det-item .det-name { font-weight: bold; color: #4fc3f7; font-size: 0.9rem; }
+    .det-item .det-conf { color: #a5d6a7; }
+    .det-item .det-time { color: #777; font-size: 0.75rem; margin-top: 2px; }
+    #detect-list .empty { color: #555; text-align: center; padding: 20px; font-size: 0.85rem; }
+
+    /* GPS widget at bottom of right panel */
+    #gps-widget {
+      padding: 8px 12px;
+      background: #1a1a2e;
+      border-top: 1px solid #333;
+      font-size: 0.8rem;
+    }
+    #gps-widget .gps-title { color: #aaa; margin-bottom: 4px; }
+    #gps-widget .gps-coords { color: #80cbc4; font-weight: bold; font-size: 0.85rem; }
+    #gps-widget .gps-coords.no-fix { color: #555; font-weight: normal; }
   </style>
 </head>
 <body>
 
   <header>
-    🤖 <span>Hailo AI HAT</span>&nbsp;— Phát hiện côn trùng thời gian thực
-    <div class="controls">
-      <button class="btn btn-on"      onclick="ledOn()">💡 Bật đèn</button>
-      <button class="btn btn-off"     onclick="ledOff()">💡 Tắt đèn</button>
-      <button class="btn btn-uva-on"  onclick="uvaOn()">🔵 Bật UVA</button>
-      <button class="btn btn-uva-off" onclick="uvaOff()">🔵 Tắt UVA</button>
+    🤖 <div class="title"><span>Hailo AI HAT</span> — Phát hiện object thời gian thực</div>
+    <div class="meta">
+      Model: <strong id="hdr-model">…</strong>
+      &nbsp;|&nbsp;
+      FPS: <strong id="hdr-fps">0</strong>
     </div>
   </header>
 
@@ -106,37 +131,59 @@
       <div class="panel-title">📷 Camera – detection + tracking overlay</div>
       <img id="video-img" src="/camera_stream" alt="Live camera feed"/>
     </div>
+
+    <div id="detect-panel">
+      <div class="panel-title">📋 Danh sách object đang detect</div>
+      <div id="detect-list"><div class="empty">Chưa có object nào…</div></div>
+      <div id="gps-widget">
+        <div class="gps-title">📍 Vị trí GPS</div>
+        <div id="gps-coords" class="gps-coords no-fix">Chưa có tín hiệu…</div>
+      </div>
+    </div>
   </main>
 
-  <div id="status-bar">Đang kết nối…</div>
-
   <script>
-    const statusBar = document.getElementById('status-bar');
-    const videoImg  = document.getElementById('video-img');
+    const hdrModel   = document.getElementById('hdr-model');
+    const hdrFps     = document.getElementById('hdr-fps');
+    const detectList = document.getElementById('detect-list');
+    const gpsCoords  = document.getElementById('gps-coords');
 
-    // FPS counter from image load events
-    let frameCount = 0;
-    videoImg.addEventListener('load', () => { frameCount++; });
-    setInterval(() => {
-      statusBar.textContent = `FPS: ${frameCount}`;
-      frameCount = 0;
-    }, 1000);
-
-    // Helper: call a POST endpoint and show result
-    async function post(url) {
+    async function fetchDetections() {
       try {
-        const res  = await fetch(url, { method: 'POST' });
+        const res  = await fetch('/detections');
         const data = await res.json();
-        statusBar.textContent = data.msg || JSON.stringify(data);
+
+        if (data.model) hdrModel.textContent = data.model;
+        hdrFps.textContent = (data.fps != null) ? data.fps.toFixed(1) : '0';
+
+        const items = data.detections || [];
+        if (items.length === 0) {
+          detectList.innerHTML = '<div class="empty">Chưa có object nào…</div>';
+        } else {
+          detectList.innerHTML = items.map(d => `
+            <div class="det-item">
+              <div class="det-name">${d.class}</div>
+              <div class="det-conf">Confidence: ${(d.confidence * 100).toFixed(1)}%</div>
+              <div class="det-time">${d.detected_at}</div>
+            </div>
+          `).join('');
+        }
+
+        const gps = data.gps;
+        if (gps && gps.lat != null && gps.lon != null) {
+          gpsCoords.className = 'gps-coords';
+          gpsCoords.textContent = `${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)}`;
+        } else {
+          gpsCoords.className = 'gps-coords no-fix';
+          gpsCoords.textContent = 'Chưa có tín hiệu…';
+        }
       } catch (e) {
-        statusBar.textContent = 'Lỗi: ' + e;
+        console.warn('fetch /detections failed:', e);
       }
     }
 
-    function ledOn()  { post('/turn_on_led');  }
-    function ledOff() { post('/turn_off_led'); }
-    function uvaOn()  { post('/turn_on_uva');  }
-    function uvaOff() { post('/turn_off_uva'); }
+    fetchDetections();
+    setInterval(fetchDetections, 500);
   </script>
 
 </body>
