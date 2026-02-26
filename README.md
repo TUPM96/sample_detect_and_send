@@ -239,3 +239,4 @@ sudo systemctl status ai-hat.service
 | `FileNotFoundError: *.hef` | Model chưa có | Copy file `.hef` vào thư mục project (xem mục 2) |
 | `Permission denied: /dev/ttyAMA0` | UART chưa bật | `raspi-config` → Interface → Serial Port → Enable |
 | Web UI không hiển thị | Port bị chặn | Kiểm tra firewall: `sudo ufw allow 8080` |
+
