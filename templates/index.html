@@ -102,6 +102,17 @@
     .det-item .det-conf { color: #a5d6a7; }
     .det-item .det-time { color: #777; font-size: 0.75rem; margin-top: 2px; }
     #detect-list .empty { color: #555; text-align: center; padding: 20px; font-size: 0.85rem; }
+
+    /* GPS widget at bottom of right panel */
+    #gps-widget {
+      padding: 8px 12px;
+      background: #1a1a2e;
+      border-top: 1px solid #333;
+      font-size: 0.8rem;
+    }
+    #gps-widget .gps-title { color: #aaa; margin-bottom: 4px; }
+    #gps-widget .gps-coords { color: #80cbc4; font-weight: bold; font-size: 0.85rem; }
+    #gps-widget .gps-coords.no-fix { color: #555; font-weight: normal; }
   </style>
 </head>
 <body>
@@ -124,6 +135,10 @@
     <div id="detect-panel">
       <div class="panel-title">📋 Danh sách object đang detect</div>
       <div id="detect-list"><div class="empty">Chưa có object nào…</div></div>
+      <div id="gps-widget">
+        <div class="gps-title">📍 Vị trí GPS</div>
+        <div id="gps-coords" class="gps-coords no-fix">Chưa có tín hiệu…</div>
+      </div>
     </div>
   </main>
 
@@ -131,6 +146,7 @@
     const hdrModel   = document.getElementById('hdr-model');
     const hdrFps     = document.getElementById('hdr-fps');
     const detectList = document.getElementById('detect-list');
+    const gpsCoords  = document.getElementById('gps-coords');
 
     async function fetchDetections() {
       try {
@@ -151,6 +167,15 @@
               <div class="det-time">${d.detected_at}</div>
             </div>
           `).join('');
+        }
+
+        const gps = data.gps;
+        if (gps && gps.lat != null && gps.lon != null) {
+          gpsCoords.className = 'gps-coords';
+          gpsCoords.textContent = `${gps.lat.toFixed(6)}, ${gps.lon.toFixed(6)}`;
+        } else {
+          gpsCoords.className = 'gps-coords no-fix';
+          gpsCoords.textContent = 'Chưa có tín hiệu…';
         }
       } catch (e) {
         console.warn('fetch /detections failed:', e);

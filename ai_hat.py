@@ -93,6 +93,10 @@ _tracker_lock = threading.Lock()   # protects logged_tracker_ids
 _display_state: dict = {"detections": [], "fps": 0.0, "model": ""}
 _display_lock = threading.Lock()
 
+# GPS state (updated by background thread)
+_gps_state: dict = {"lat": None, "lon": None}
+_gps_lock = threading.Lock()
+
 # Populated after CLI arg parsing
 input_queue: queue.Queue = None
 output_queue: queue.Queue = None
@@ -323,6 +327,59 @@ def start_mqtt_subscribers() -> None:
     threading.Thread(target=_run, args=(SENSOR_TOPIC, _on_sensor_message), daemon=True).start()
 
 # ---------------------------------------------------------------------------
+# GPS thread
+# ---------------------------------------------------------------------------
+
+GPS_PORT = "/dev/ttyAMA0"
+GPS_BAUD = 9600
+
+
+def _gps_reader_loop() -> None:
+    """Background thread: read NMEA sentences and update _gps_state."""
+    try:
+        import pynmea2  # noqa: PLC0415
+        import serial   # noqa: PLC0415
+    except ImportError:
+        print("GPS: pynmea2 or pyserial not installed – GPS disabled.")
+        return
+
+    try:
+        ser = serial.Serial(GPS_PORT, GPS_BAUD, timeout=1)
+    except Exception as e:
+        print(f"GPS: cannot open {GPS_PORT}: {e}")
+        return
+
+    print(f"GPS: reading from {GPS_PORT} at {GPS_BAUD} baud")
+    while True:
+        try:
+            line = ser.readline().decode("ascii", errors="replace").strip()
+        except Exception as e:
+            print(f"GPS read error: {e}")
+            time.sleep(1)
+            continue
+
+        if not line.startswith("$"):
+            continue
+        try:
+            msg = pynmea2.parse(line)
+        except pynmea2.ParseError:
+            continue
+
+        lat = lon = None
+        if msg.sentence_type in ("GGA", "RMC"):
+            lat = getattr(msg, "latitude", None)
+            lon = getattr(msg, "longitude", None)
+
+        if lat is not None and lon is not None:
+            with _gps_lock:
+                _gps_state["lat"] = round(float(lat), 6)
+                _gps_state["lon"] = round(float(lon), 6)
+
+
+def start_gps_thread() -> None:
+    threading.Thread(target=_gps_reader_loop, daemon=True).start()
+
+# ---------------------------------------------------------------------------
 # Flask application
 # ---------------------------------------------------------------------------
 
@@ -408,11 +465,14 @@ def sensor_data():
 @app.route("/detections")
 def detections_route():
     with _display_lock:
-        return jsonify({
+        payload = {
             "detections": list(_display_state["detections"]),
             "fps": _display_state["fps"],
             "model": _display_state["model"],
-        })
+        }
+    with _gps_lock:
+        payload["gps"] = {"lat": _gps_state["lat"], "lon": _gps_state["lon"]}
+    return jsonify(payload)
 
 
 @app.route("/control", methods=["POST"])
@@ -506,6 +566,9 @@ if __name__ == "__main__":
 
     # Start MQTT subscribers (non-fatal if broker unreachable)
     start_mqtt_subscribers()
+
+    # Start GPS reader thread (non-fatal if serial port unavailable)
+    start_gps_thread()
 
     # Start camera capture thread
     threading.Thread(target=camera_capture_loop, args=(args.camera,), daemon=True).start()
