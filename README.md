@@ -9,13 +9,17 @@ Web UI hiển thị live video (MJPEG) kèm danh sách object được phát hi�
 
 ```
 sample_detect_and_send/
-├── ai_hat.py          # Flask web server + Hailo inference loop
-├── gps.py             # Script test GPS qua serial NMEA
+├── ai_hat.py              # Flask web server + Hailo inference loop (COCO)
+├── utils.py               # HailoAsyncInference helper class
+├── gps.py                 # Script test GPS qua serial NMEA
+├── config.json            # Hardware config (motor speed, timing…)
+├── con_trung/             # Submodule: insect detection dataset/scripts
 ├── data/
-│   └── coco.txt       # 80 COCO class labels
+│   ├── coco.txt           # 80 COCO class labels
+│   └── contrung_labels.txt  # 9 insect class labels
 ├── templates/
-│   └── index.html     # Web UI (live video + detection list)
-├── requirements.txt   # Python dependencies
+│   └── index.html         # Web UI (live video + detection list)
+├── requirements.txt       # Python dependencies
 ├── .gitignore
 └── README.md
 ```
